@@ -1,0 +1,776 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>RETRO GRIDIRON</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; user-select: none; }
+  body {
+    background-color: #111;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    height: 100vh;
+    font-family: 'Courier New', Courier, monospace;
+    color: #fff;
+    overflow: hidden;
+  }
+  #game-container {
+    position: relative;
+    border: 6px solid #444;
+    box-shadow: 0 0 30px rgba(0,0,0,0.9);
+    background: #2b7a2b;
+  }
+  canvas {
+    display: block;
+    image-rendering: pixelated;
+  }
+  #hud {
+    width: 900px;
+    background: #1c1c24;
+    border: 6px solid #444;
+    border-bottom: none;
+    padding: 10px 20px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-weight: bold;
+    font-size: 18px;
+    letter-spacing: 1px;
+  }
+  .hud-box {
+    background: #000;
+    padding: 6px 12px;
+    border: 2px solid #555;
+    color: #f8d830;
+  }
+  .hud-team { color: #4da6ff; }
+  .hud-cpu { color: #ff5555; }
+  #instructions {
+    margin-top: 10px;
+    color: #aaa;
+    font-size: 13px;
+    text-align: center;
+  }
+</style>
+</head>
+<body>
+
+<div id="hud">
+  <div><span class="hud-team">HOME: <span id="score-home">0</span></span> | <span class="hud-cpu">AWAY: <span id="score-away">0</span></span></div>
+  <div class="hud-box" id="down-display">1ST & 10</div>
+  <div class="hud-box" id="ball-on-display">BALL ON 20</div>
+  <div class="hud-box" id="quarter-display">QTR 1 - 2:00</div>
+</div>
+
+<div id="game-container">
+  <canvas id="game" width="900" height="500"></canvas>
+</div>
+
+<div id="instructions">
+  [SPACE] Snap / Next Play &nbsp;|&nbsp; [CLICK + DRAG BACK] Aim & Throw &nbsp;|&nbsp; [CLICK QB] Scramble &nbsp;|&nbsp; [DRAG / W-S] Juke Runner
+</div>
+
+<script>
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+// Game Constants & Scale
+const PIXELS_PER_YARD = 16;
+const FIELD_WIDTH_YARDS = 120; // 100 yds + two 10-yd endzones
+const FIELD_HEIGHT_YARDS = 53.3;
+
+// Audio Synthesizer (Retro 8-bit Sound Effects)
+const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+function playTone(freq, type, duration, vol = 0.1) {
+  if (audioCtx.state === 'suspended') audioCtx.resume();
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.type = type;
+  osc.frequency.setValueAtTime(freq, audioCtx.currentTime);
+  gain.gain.setValueAtTime(vol, audioCtx.currentTime);
+  gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + duration);
+  osc.connect(gain);
+  gain.connect(audioCtx.destination);
+  osc.start();
+  osc.stop(audioCtx.currentTime + duration);
+}
+
+const sfx = {
+  snap: () => playTone(150, 'square', 0.08),
+  throw: () => { playTone(300, 'triangle', 0.12); setTimeout(() => playTone(450, 'triangle', 0.1), 50); },
+  catch: () => playTone(600, 'square', 0.1),
+  tackle: () => playTone(90, 'sawtooth', 0.2, 0.2),
+  td: () => {
+    [523, 659, 784, 1046].forEach((f, i) => setTimeout(() => playTone(f, 'square', 0.2, 0.15), i * 120));
+  },
+  whistle: () => {
+    playTone(2800, 'sine', 0.15, 0.08);
+    setTimeout(() => playTone(2600, 'sine', 0.25, 0.08), 160);
+  }
+};
+
+// Game State
+let state = {
+  phase: 'PRE_SNAP', // PRE_SNAP, PASSING, RUNNING, PLAY_OVER, GAME_OVER
+  message: 'PRESS SPACE TO SNAP',
+  subMessage: '',
+  homeScore: 0,
+  awayScore: 0,
+  quarter: 1,
+  clock: 120, // seconds per quarter
+  down: 1,
+  yardsToGo: 10,
+  lineOfScrimmage: 30, // 10 = own endzone line, 110 = opp endzone line
+  firstDownLine: 40,
+  cameraX: 0,
+  isDragging: false,
+  dragStart: { x: 0, y: 0 },
+  dragCurrent: { x: 0, y: 0 },
+  keys: {}
+};
+
+// Entities
+let qb = null;
+let receivers = [];
+let oLine = [];
+let defenders = [];
+let ball = { x: 0, y: 0, z: 0, vx: 0, vy: 0, vz: 0, carrier: null, inAir: false, targetX: 0, targetY: 0 };
+
+function initPlay() {
+  state.phase = 'PRE_SNAP';
+  state.message = 'PRESS SPACE TO SNAP';
+  state.subMessage = '';
+  state.isDragging = false;
+
+  const los = state.lineOfScrimmage;
+  const midY = FIELD_HEIGHT_YARDS / 2;
+
+  // Quarterback
+  qb = {
+    x: los - 4, y: midY, vx: 0, vy: 0,
+    speed: 11.5, radius: 0.7, color: '#2b7fff', helmet: '#ffffff',
+    isScrambling: false, tackled: false
+  };
+
+  // Offensive Line (Blockers)
+  oLine = [];
+  [-3, -1.5, 0, 1.5, 3].forEach(offset => {
+    oLine.push({
+      x: los - 0.8, y: midY + offset, vx: 0, vy: 0,
+      speed: 7, radius: 0.75, color: '#2b7fff', helmet: '#ffffff'
+    });
+  });
+
+  // Receivers with preset routes
+  receivers = [
+    { x: los - 0.8, y: midY - 14, route: 'STREAK', speed: 14.5, radius: 0.7, color: '#2b7fff', helmet: '#ffffff', hasBall: false },
+    { x: los - 0.8, y: midY - 7,  route: 'SLANT_IN', speed: 14.0, radius: 0.7, color: '#2b7fff', helmet: '#ffffff', hasBall: false },
+    { x: los - 0.8, y: midY + 8,  route: 'POST', speed: 14.2, radius: 0.7, color: '#2b7fff', helmet: '#ffffff', hasBall: false },
+    { x: los - 0.8, y: midY + 15, route: 'OUT', speed: 13.8, radius: 0.7, color: '#2b7fff', helmet: '#ffffff', hasBall: false }
+  ];
+
+  // Defenders (D-Line + Linebackers + DBs)
+  defenders = [];
+  // Pass rushers
+  [-2.5, 0, 2.5].forEach(offset => {
+    defenders.push({
+      x: los + 1.0, y: midY + offset, role: 'RUSH',
+      speed: 10.2, radius: 0.75, color: '#e63946', helmet: '#ffd166', blockedTimer: 0
+    });
+  });
+  // Coverage DBs
+  receivers.forEach((rec, idx) => {
+    defenders.push({
+      x: los + 5 + (idx % 2) * 2, y: rec.y, role: 'COVER', targetRec: rec,
+      speed: 13.2, radius: 0.7, color: '#e63946', helmet: '#ffd166', blockedTimer: 0
+    });
+  });
+
+  // Ball starts with QB
+  ball = {
+    x: qb.x, y: qb.y, z: 1.5,
+    vx: 0, vy: 0, vz: 0,
+    carrier: qb, inAir: false
+  };
+
+  updateHUD();
+}
+
+function snapBall() {
+  if (state.phase !== 'PRE_SNAP') return;
+  sfx.snap();
+  state.phase = 'PASSING';
+  state.message = '';
+}
+
+function endPlay(endX, reason, turnover = false) {
+  if (state.phase === 'PLAY_OVER' || state.phase === 'GAME_OVER') return;
+  state.phase = 'PLAY_OVER';
+  sfx.whistle();
+
+  // Check Touchdown
+  if (!turnover && endX >= 110) {
+    sfx.td();
+    state.homeScore += 7;
+    state.message = 'TOUCHDOWN! +7 PTS';
+    state.subMessage = 'PRESS SPACE FOR NEXT DRIVE';
+    resetDrive(30);
+    updateHUD();
+    return;
+  }
+
+  // Clamp field position
+  endX = Math.max(11, Math.min(109, endX));
+
+  if (turnover) {
+    state.message = reason;
+    state.subMessage = 'OPPONENT SCORES FG (+3) - SPACE TO CONTINUE';
+    state.awayScore += 3;
+    resetDrive(30);
+    updateHUD();
+    return;
+  }
+
+  const gained = Math.round(endX - state.lineOfScrimmage);
+  state.lineOfScrimmage = Math.round(endX);
+
+  if (state.lineOfScrimmage >= state.firstDownLine) {
+    state.down = 1;
+    state.yardsToGo = 10;
+    state.firstDownLine = Math.min(110, state.lineOfScrimmage + 10);
+    state.message = `${reason} (+${gained} YDS) - 1ST DOWN!`;
+  } else {
+    state.down++;
+    state.yardsToGo = state.firstDownLine - state.lineOfScrimmage;
+    if (state.down > 4) {
+      state.message = 'TURNOVER ON DOWNS!';
+      state.subMessage = 'OPPONENT SCORES FG (+3) - SPACE TO CONTINUE';
+      state.awayScore += 3;
+      resetDrive(30);
+      updateHUD();
+      return;
+    } else {
+      state.message = `${reason} (${gained >= 0 ? '+' : ''}${gained} YDS)`;
+    }
+  }
+
+  state.subMessage = 'PRESS SPACE FOR NEXT PLAY';
+  updateHUD();
+}
+
+function resetDrive(startYard) {
+  state.down = 1;
+  state.yardsToGo = 10;
+  state.lineOfScrimmage = startYard;
+  state.firstDownLine = startYard + 10;
+}
+
+function updateHUD() {
+  document.getElementById('score-home').innerText = state.homeScore;
+  document.getElementById('score-away').innerText = state.awayScore;
+
+  const suffixes = ['ST', 'ND', 'RD', 'TH'];
+  const dStr = `${state.down}${suffixes[state.down - 1]} & ${state.yardsToGo}`;
+  document.getElementById('down-display').innerText = dStr;
+
+  const yardNum = state.lineOfScrimmage - 10;
+  const side = yardNum <= 50 ? `OWN ${yardNum}` : `OPP ${100 - yardNum}`;
+  document.getElementById('ball-on-display').innerText = `BALL ON ${side}`;
+
+  const mins = Math.floor(state.clock / 60);
+  const secs = Math.floor(state.clock % 60).toString().padStart(2, '0');
+  document.getElementById('quarter-display').innerText = `QTR ${state.quarter} - ${mins}:${secs}`;
+}
+
+// Input Handling
+canvas.addEventListener('mousedown', (e) => {
+  if (audioCtx.state === 'suspended') audioCtx.resume();
+  const rect = canvas.getBoundingClientRect();
+  const mx = e.clientX - rect.left;
+  const my = e.clientY - rect.top;
+
+  if (state.phase === 'PRE_SNAP') {
+    snapBall();
+  }
+
+  if (state.phase === 'PASSING' && !qb.isScrambling) {
+    // Check if player clicked on QB to scramble
+    const qbScreenX = (qb.x - state.cameraX) * PIXELS_PER_YARD;
+    const qbScreenY = qb.y * PIXELS_PER_YARD;
+    if (Math.hypot(mx - qbScreenX, my - qbScreenY) < 28) {
+      qb.isScrambling = true;
+      state.phase = 'RUNNING';
+      return;
+    }
+  }
+
+  state.isDragging = true;
+  state.dragStart = { x: mx, y: my };
+  state.dragCurrent = { x: mx, y: my };
+});
+
+window.addEventListener('mousemove', (e) => {
+  if (!state.isDragging) return;
+  const rect = canvas.getBoundingClientRect();
+  state.dragCurrent = {
+    x: e.clientX - rect.left,
+    y: e.clientY - rect.top
+  };
+});
+
+window.addEventListener('mouseup', () => {
+  if (!state.isDragging) return;
+  state.isDragging = false;
+
+  if (state.phase === 'PASSING' && !qb.isScrambling && ball.carrier === qb) {
+    // Slingshot throw calculation
+    const dx = state.dragStart.x - state.dragCurrent.x;
+    const dy = state.dragStart.y - state.dragCurrent.y;
+    const pullDist = Math.hypot(dx, dy);
+
+    if (pullDist > 15) {
+      const power = Math.min(pullDist, 180) / 180; // 0 to 1
+      const throwSpeed = 18 + power * 20; // yards/sec
+      const angle = Math.atan2(dy, dx);
+
+      ball.carrier = null;
+      ball.inAir = true;
+      ball.vx = Math.cos(angle) * throwSpeed;
+      ball.vy = Math.sin(angle) * throwSpeed;
+      ball.vz = 6 + power * 10; // vertical loft
+      sfx.throw();
+    }
+  }
+});
+
+window.addEventListener('keydown', (e) => {
+  state.keys[e.code] = true;
+  if (e.code === 'Space') {
+    e.preventDefault();
+    if (state.phase === 'PRE_SNAP') snapBall();
+    else if (state.phase === 'PLAY_OVER') initPlay();
+    else if (state.phase === 'GAME_OVER') {
+      state.homeScore = 0; state.awayScore = 0;
+      state.quarter = 1; state.clock = 120;
+      resetDrive(30);
+      initPlay();
+    }
+  }
+});
+
+window.addEventListener('keyup', (e) => {
+  state.keys[e.code] = false;
+});
+
+// Physics & AI Update Loop
+function update(dt) {
+  // Camera smoothly tracks ball
+  const targetCamX = Math.max(0, Math.min(FIELD_WIDTH_YARDS - canvas.width / PIXELS_PER_YARD, ball.x - 16));
+  state.cameraX += (targetCamX - state.cameraX) * 8 * dt;
+
+  if (state.phase !== 'PASSING' && state.phase !== 'RUNNING') return;
+
+  // Game Clock
+  state.clock -= dt;
+  if (state.clock <= 0) {
+    state.clock = 0;
+    if (state.quarter < 4) {
+      state.quarter++;
+      state.clock = 120;
+      endPlay(ball.x, `END OF QTR ${state.quarter - 1}`);
+      return;
+    } else {
+      state.phase = 'GAME_OVER';
+      state.message = state.homeScore > state.awayScore ? 'VICTORY!' : (state.homeScore < state.awayScore ? 'DEFEAT!' : 'TIE GAME!');
+      state.subMessage = `FINAL: ${state.homeScore} - ${state.awayScore} (SPACE TO PLAY AGAIN)`;
+      updateHUD();
+      return;
+    }
+  }
+  updateHUD();
+
+  const los = state.lineOfScrimmage;
+
+  // 1. Update Receivers
+  receivers.forEach(rec => {
+    if (ball.carrier === rec) return; // Controlled as runner
+
+    const depth = rec.x - los;
+    let targetVx = rec.speed;
+    let targetVy = 0;
+
+    if (rec.route === 'SLANT_IN' && depth > 4) {
+      targetVx = rec.speed * 0.75;
+      targetVy = rec.y < FIELD_HEIGHT_YARDS / 2 ? rec.speed * 0.65 : -rec.speed * 0.65;
+    } else if (rec.route === 'POST' && depth > 10) {
+      targetVx = rec.speed * 0.8;
+      targetVy = rec.y < FIELD_HEIGHT_YARDS / 2 ? rec.speed * 0.5 : -rec.speed * 0.5;
+    } else if (rec.route === 'OUT' && depth > 8) {
+      targetVx = rec.speed * 0.2;
+      targetVy = rec.y < FIELD_HEIGHT_YARDS / 2 ? -rec.speed * 0.9 : rec.speed * 0.9;
+    }
+
+    // If ball is in air, nearest receiver adjusts toward landing zone
+    if (ball.inAir) {
+      const distToBall = Math.hypot(ball.x - rec.x, ball.y - rec.y);
+      if (distToBall < 14) {
+        const ang = Math.atan2(ball.y - rec.y, ball.x - rec.x);
+        targetVx = Math.cos(ang) * rec.speed;
+        targetVy = Math.sin(ang) * rec.speed;
+      }
+    }
+
+    rec.x += targetVx * dt;
+    rec.y = Math.max(2, Math.min(FIELD_HEIGHT_YARDS - 2, rec.y + targetVy * dt));
+  });
+
+  // 2. Update Ball Carrier (QB Scramble or Receiver YAC)
+  if (ball.carrier && (state.phase === 'RUNNING' || qb.isScrambling)) {
+    const runner = ball.carrier;
+    let moveY = 0;
+
+    if (state.isDragging) {
+      const dy = state.dragCurrent.y - state.dragStart.y;
+      if (Math.abs(dy) > 8) {
+        moveY = Math.sign(dy) * Math.min(1, Math.abs(dy) / 40);
+      }
+    }
+    if (state.keys['KeyW'] || state.keys['ArrowUp']) moveY = -1;
+    if (state.keys['KeyS'] || state.keys['ArrowDown']) moveY = 1;
+
+    runner.x += runner.speed * dt;
+    runner.y += moveY * (runner.speed * 0.85) * dt;
+
+    ball.x = runner.x;
+    ball.y = runner.y;
+
+    // Out of bounds or Touchdown check
+    if (runner.y <= 1.2 || runner.y >= FIELD_HEIGHT_YARDS - 1.2) {
+      endPlay(runner.x, 'OUT OF BOUNDS');
+      return;
+    }
+    if (runner.x >= 110) {
+      endPlay(runner.x, 'TOUCHDOWN!');
+      return;
+    }
+  }
+
+  // 3. Update Ball in Air
+  if (ball.inAir) {
+    ball.x += ball.vx * dt;
+    ball.y += ball.vy * dt;
+    ball.z += ball.vz * dt;
+    ball.vz -= 22 * dt; // gravity
+
+    // Check catches when ball is within catchable height
+    if (ball.z <= 2.6 && ball.z >= 0) {
+      // Check Receiver Catch
+      for (let rec of receivers) {
+        if (Math.hypot(ball.x - rec.x, ball.y - rec.y) < 1.6) {
+          ball.inAir = false;
+          ball.carrier = rec;
+          ball.z = 1.5;
+          state.phase = 'RUNNING';
+          sfx.catch();
+          break;
+        }
+      }
+      // Check Defender Interception
+      if (ball.inAir) {
+        for (let def of defenders) {
+          if (Math.hypot(ball.x - def.x, ball.y - def.y) < 1.3) {
+            ball.inAir = false;
+            sfx.tackle();
+            endPlay(ball.x, 'INTERCEPTED!', true);
+            return;
+          }
+        }
+      }
+    }
+
+    // Hit ground = Incomplete
+    if (ball.z <= 0) {
+      ball.inAir = false;
+      endPlay(state.lineOfScrimmage, 'INCOMPLETE PASS');
+      return;
+    }
+  }
+
+  // 4. Update Offensive Line & Defenders
+  oLine.forEach(ol => {
+    // Find nearest rusher to block
+    let closest = null, minDist = 999;
+    defenders.forEach(def => {
+      const d = Math.hypot(def.x - ol.x, def.y - ol.y);
+      if (d < minDist) { minDist = d; closest = def; }
+    });
+    if (closest && minDist < 6) {
+      const ang = Math.atan2(closest.y - ol.y, closest.x - ol.x);
+      ol.x += Math.cos(ang) * ol.speed * dt;
+      ol.y += Math.sin(ang) * ol.speed * dt;
+      if (minDist < 1.3) closest.blockedTimer = 0.25;
+    }
+  });
+
+  for (let def of defenders) {
+    if (def.blockedTimer > 0) {
+      def.blockedTimer -= dt;
+      continue;
+    }
+
+    let targetX, targetY;
+    if (state.phase === 'RUNNING' || ball.inAir || def.role === 'RUSH') {
+      // Pursue ball or ball carrier
+      targetX = ball.x + (ball.carrier ? 1.5 : 0);
+      targetY = ball.y;
+    } else {
+      // Cover assigned receiver
+      targetX = def.targetRec.x + 1.2;
+      targetY = def.targetRec.y;
+    }
+
+    const ang = Math.atan2(targetY - def.y, targetX - def.x);
+    def.x += Math.cos(ang) * def.speed * dt;
+    def.y += Math.sin(ang) * def.speed * dt;
+
+    // Tackle Check
+    if (ball.carrier && Math.hypot(def.x - ball.carrier.x, def.y - ball.carrier.y) < 1.25) {
+      sfx.tackle();
+      const label = ball.carrier === qb && !qb.isScrambling ? 'SACKED!' : 'TACKLED';
+      endPlay(ball.carrier.x, label);
+      return;
+    }
+  }
+}
+
+// Rendering
+function drawField() {
+  const camPx = state.cameraX * PIXELS_PER_YARD;
+  ctx.save();
+  ctx.translate(-camPx, 0);
+
+  // Turf stripes (alternating retro greens)
+  for (let y = 0; y < FIELD_WIDTH_YARDS; y += 5) {
+    ctx.fillStyle = (y / 5) % 2 === 0 ? '#2e852e' : '#267326';
+    ctx.fillRect(y * PIXELS_PER_YARD, 0, 5 * PIXELS_PER_YARD, canvas.height);
+  }
+
+  // Endzones
+  ctx.fillStyle = '#1b4965'; // Home Endzone (0 to 10 yds)
+  ctx.fillRect(0, 0, 10 * PIXELS_PER_YARD, canvas.height);
+  ctx.fillStyle = '#9b2226'; // Away Endzone (110 to 120 yds)
+  ctx.fillRect(110 * PIXELS_PER_YARD, 0, 10 * PIXELS_PER_YARD, canvas.height);
+
+  // Endzone Text
+  ctx.save();
+  ctx.fillStyle = 'rgba(255,255,255,0.4)';
+  ctx.font = 'bold 36px Courier New';
+  ctx.textAlign = 'center';
+  ctx.translate(5 * PIXELS_PER_YARD, canvas.height / 2);
+  ctx.rotate(-Math.PI / 2);
+  ctx.fillText('HOME', 0, 12);
+  ctx.restore();
+
+  ctx.save();
+  ctx.fillStyle = 'rgba(255,255,255,0.4)';
+  ctx.font = 'bold 36px Courier New';
+  ctx.textAlign = 'center';
+  ctx.translate(115 * PIXELS_PER_YARD, canvas.height / 2);
+  ctx.rotate(Math.PI / 2);
+  ctx.fillText('AWAY', 0, 12);
+  ctx.restore();
+
+  // Yard Lines & Numbers
+  ctx.strokeStyle = 'rgba(255,255,255,0.75)';
+  ctx.lineWidth = 2;
+  ctx.fillStyle = 'rgba(255,255,255,0.75)';
+  ctx.font = 'bold 16px Courier New';
+  ctx.textAlign = 'center';
+
+  for (let yard = 10; yard <= 110; yard += 5) {
+    const x = yard * PIXELS_PER_YARD;
+    ctx.beginPath();
+    ctx.moveTo(x, 0);
+    ctx.lineTo(x, canvas.height);
+    ctx.stroke();
+
+    if (yard > 10 && yard < 110 && yard % 10 === 0) {
+      const displayNum = yard <= 60 ? yard - 10 : 110 - yard;
+      ctx.fillText(displayNum, x, 35);
+      ctx.fillText(displayNum, x, canvas.height - 20);
+    }
+  }
+
+  // Hash Marks
+  for (let yard = 11; yard < 110; yard++) {
+    const x = yard * PIXELS_PER_YARD;
+    ctx.fillRect(x - 1, canvas.height * 0.35, 2, 6);
+    ctx.fillRect(x - 1, canvas.height * 0.65, 2, 6);
+  }
+
+  // Line of Scrimmage (Blue) & First Down Line (Yellow)
+  ctx.strokeStyle = '#3a86ff';
+  ctx.lineWidth = 4;
+  ctx.beginPath();
+  ctx.moveTo(state.lineOfScrimmage * PIXELS_PER_YARD, 0);
+  ctx.lineTo(state.lineOfScrimmage * PIXELS_PER_YARD, canvas.height);
+  ctx.stroke();
+
+  ctx.strokeStyle = '#ffbe0b';
+  ctx.lineWidth = 4;
+  ctx.beginPath();
+  ctx.moveTo(state.firstDownLine * PIXELS_PER_YARD, 0);
+  ctx.lineTo(state.firstDownLine * PIXELS_PER_YARD, canvas.height);
+  ctx.stroke();
+
+  // Pre-snap Route Previews
+  if (state.phase === 'PRE_SNAP') {
+    ctx.strokeStyle = 'rgba(255, 230, 0, 0.75)';
+    ctx.setLineDash([6, 6]);
+    ctx.lineWidth = 3;
+    receivers.forEach(rec => {
+      const sx = rec.x * PIXELS_PER_YARD;
+      const sy = rec.y * PIXELS_PER_YARD;
+      ctx.beginPath();
+      ctx.moveTo(sx, sy);
+      if (rec.route === 'STREAK') {
+        ctx.lineTo(sx + 180, sy);
+      } else if (rec.route === 'SLANT_IN') {
+        ctx.lineTo(sx + 60, sy);
+        ctx.lineTo(sx + 150, sy + (rec.y < FIELD_HEIGHT_YARDS / 2 ? 80 : -80));
+      } else if (rec.route === 'POST') {
+        ctx.lineTo(sx + 130, sy);
+        ctx.lineTo(sx + 200, sy + (rec.y < FIELD_HEIGHT_YARDS / 2 ? 60 : -60));
+      } else if (rec.route === 'OUT') {
+        ctx.lineTo(sx + 110, sy);
+        ctx.lineTo(sx + 130, sy + (rec.y < FIELD_HEIGHT_YARDS / 2 ? -80 : 80));
+      }
+      ctx.stroke();
+    });
+    ctx.setLineDash([]);
+  }
+
+  // Draw Players (Retro Blocky Sprites)
+  const drawPlayer = (p, hasStar = false) => {
+    const px = p.x * PIXELS_PER_YARD;
+    const py = p.y * PIXELS_PER_YARD;
+
+    // Shadow
+    ctx.fillStyle = 'rgba(0,0,0,0.35)';
+    ctx.beginPath();
+    ctx.ellipse(px, py + 10, 11, 5, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Jersey / Shoulders
+    ctx.fillStyle = p.color;
+    ctx.fillRect(px - 9, py - 9, 18, 18);
+    ctx.strokeStyle = '#000';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(px - 9, py - 9, 18, 18);
+
+    // Helmet
+    ctx.fillStyle = p.helmet;
+    ctx.fillRect(px - 5, py - 12, 11, 10);
+    ctx.strokeRect(px - 5, py - 12, 11, 10);
+
+    // Star indicator for skill players
+    if (hasStar) {
+      ctx.fillStyle = '#ffbe0b';
+      ctx.fillRect(px - 2, py + 14, 4, 4);
+    }
+  };
+
+  oLine.forEach(p => drawPlayer(p));
+  receivers.forEach(p => drawPlayer(p, true));
+  defenders.forEach(p => drawPlayer(p));
+  drawPlayer(qb, true);
+
+  // Draw Football
+  const bx = ball.x * PIXELS_PER_YARD;
+  const by = ball.y * PIXELS_PER_YARD;
+  const bz = ball.z * 6; // visual height offset
+
+  if (ball.inAir) {
+    // Ground shadow
+    ctx.fillStyle = 'rgba(0,0,0,0.4)';
+    ctx.beginPath();
+    ctx.ellipse(bx, by + 6, 8, 4, 0, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  ctx.fillStyle = '#8b4513';
+  ctx.strokeStyle = '#fff';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.ellipse(bx, by - bz, 7, 4.5, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.stroke();
+
+  // Aiming Arc (Slingshot trajectory dots)
+  if (state.isDragging && state.phase === 'PASSING' && !qb.isScrambling && ball.carrier === qb) {
+    const dx = state.dragStart.x - state.dragCurrent.x;
+    const dy = state.dragStart.y - state.dragCurrent.y;
+    const pullDist = Math.hypot(dx, dy);
+
+    if (pullDist > 15) {
+      const power = Math.min(pullDist, 180) / 180;
+      const throwSpeed = 18 + power * 20;
+      const angle = Math.atan2(dy, dx);
+      const vx = Math.cos(angle) * throwSpeed;
+      const vy = Math.sin(angle) * throwSpeed;
+      const vz = 6 + power * 10;
+
+      ctx.fillStyle = '#ffffff';
+      for (let t = 0.08; t <= 1.2; t += 0.08) {
+        const simZ = 1.5 + vz * t - 0.5 * 22 * t * t;
+        if (simZ < 0) break;
+        const simX = (ball.x + vx * t) * PIXELS_PER_YARD;
+        const simY = (ball.y + vy * t) * PIXELS_PER_YARD - simZ * 6;
+        ctx.beginPath();
+        ctx.arc(simX, simY, 3.5, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+  }
+
+  ctx.restore();
+
+  // Overlay Banner Messages
+  if (state.message) {
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.72)';
+    ctx.fillRect(0, canvas.height / 2 - 48, canvas.width, 96);
+    ctx.strokeStyle = '#ffbe0b';
+    ctx.lineWidth = 3;
+    ctx.strokeRect(0, canvas.height / 2 - 48, canvas.width, 96);
+
+    ctx.fillStyle = '#ffbe0b';
+    ctx.font = 'bold 30px Courier New';
+    ctx.textAlign = 'center';
+    ctx.fillText(state.message, canvas.width / 2, canvas.height / 2 - 5);
+
+    if (state.subMessage) {
+      ctx.fillStyle = '#ffffff';
+      ctx.font = 'bold 16px Courier New';
+      ctx.fillText(state.subMessage, canvas.width / 2, canvas.height / 2 + 28);
+    }
+  }
+}
+
+// Main Loop
+let lastTime = performance.now();
+function loop(now) {
+  const dt = Math.min((now - lastTime) / 1000, 0.05);
+  lastTime = now;
+
+  update(dt);
+  drawField();
+  requestAnimationFrame(loop);
+}
+
+initPlay();
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
